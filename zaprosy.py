@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 import urllib.request
 import tkinter as tk
 from tkinter import font as tkfont
@@ -38,8 +39,54 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 DEFAULT_GEOM = "330x520+80+80"
 
 # ---------- обновления ----------
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.5"
 GITHUB_REPO = "pingujonathan7/zaprosy"
+
+# ---------- поиск картинок ----------
+# {q} подставляется запросом. Можно поменять в state.json на любой архив.
+DEFAULT_SEARCH_URL = "https://www.google.com/search?tbm=isch&q={q}"
+
+# Открываем ссылку в одной и той же вкладке Chrome: ищем вкладку по
+# запомненному id, нашли — меняем в ней адрес, нет — заводим одну новую.
+CHROME_SCRIPT = """
+on run argv
+    set theURL to item 1 of argv
+    set wantId to (item 2 of argv) as integer
+    tell application "Google Chrome"
+        set foundTab to missing value
+        set foundWin to missing value
+        repeat with w in windows
+            repeat with t in tabs of w
+                if (id of t) is wantId then
+                    set foundTab to t
+                    set foundWin to w
+                    exit repeat
+                end if
+            end repeat
+            if foundTab is not missing value then exit repeat
+        end repeat
+        if foundTab is missing value then
+            if (count of windows) is 0 then
+                make new window
+            end if
+            set foundWin to window 1
+            set foundTab to make new tab at end of tabs of foundWin with properties {URL:theURL}
+        else
+            set URL of foundTab to theURL
+        end if
+        set idx to 0
+        repeat with i from 1 to count of tabs of foundWin
+            if (id of (tab i of foundWin)) is (id of foundTab) then
+                set idx to i
+            end if
+        end repeat
+        if idx > 0 then set active tab index of foundWin to idx
+        set index of foundWin to 1
+        activate
+        return (id of foundTab) as text
+    end tell
+end run
+"""
 
 # иконка приложения (PNG в base64)
 ICON_B64 = "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"
@@ -79,7 +126,24 @@ THEMES = {
 # живая палитра — обновляется на месте при смене темы
 C = dict(THEMES["dark"])
 
-ROW_PARTS = ("frame", "text", "num", "del", "btn")
+ROW_PARTS = ("frame", "box", "text", "hint", "num", "del", "btn")
+
+# разделитель «запрос || подсказка»
+QUERY_HINT_SEP = "||"
+
+
+def split_line(line):
+    """`запрос || подсказка` -> (запрос, подсказка).
+
+    Без разделителя возвращаем строку как есть — старые списки работают
+    в точности как раньше. В буфер уходит только первая часть.
+    """
+    if QUERY_HINT_SEP in line:
+        head, _, tail = line.partition(QUERY_HINT_SEP)
+        head = head.strip()
+        if head:
+            return head, tail.strip()
+    return line.strip(), ""
 
 
 def copy_to_clipboard(root, text):
@@ -145,6 +209,35 @@ def set_app_icon(root):
         pass
 
 
+def open_search(url, tab_id):
+    """Открывает адрес в закреплённой вкладке Chrome.
+
+    Возвращает id вкладки, чтобы в следующий раз попасть в неё же.
+    Если Chrome недоступен — отдаём ссылку системе, она откроет
+    браузер по умолчанию новой вкладкой.
+    """
+    script = os.path.join(tempfile.gettempdir(), "zaprosy_chrome.applescript")
+    try:
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(CHROME_SCRIPT)
+        res = subprocess.run(
+            ["/usr/bin/osascript", script, url, str(int(tab_id or 0))],
+            capture_output=True, timeout=20,
+        )
+        if res.returncode == 0:
+            out = res.stdout.decode("utf-8", "replace").strip()
+            if out.isdigit():
+                return int(out)
+            return tab_id
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(["/usr/bin/open", url])
+    except Exception:
+        pass
+    return tab_id
+
+
 def version_tuple(text):
     parts = []
     for chunk in re.split(r"[.\-+_]", (text or "").lstrip("vV")):
@@ -166,18 +259,49 @@ def app_bundle_path():
     return None
 
 
+def http_get(url, timeout=30):
+    """Сначала системным curl — он знает сертификаты и прокси macOS,
+    а у собранного приложения свой урезанный набор. urllib — запасной путь."""
+    try:
+        res = subprocess.run(
+            ["/usr/bin/curl", "-fsSL", "--max-time", str(timeout),
+             "-H", "User-Agent: ZaprosyPad", url],
+            capture_output=True, timeout=timeout + 10,
+        )
+        if res.returncode == 0:
+            return res.stdout
+        detail = (res.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError("curl %s: %s" % (res.returncode, detail or "нет ответа"))
+    except FileNotFoundError:
+        pass
+    req = urllib.request.Request(url, headers={"User-Agent": "ZaprosyPad"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def http_download(url, path, timeout=300):
+    try:
+        res = subprocess.run(
+            ["/usr/bin/curl", "-fL", "--max-time", str(timeout),
+             "-H", "User-Agent: ZaprosyPad", "-o", path, url],
+            capture_output=True, timeout=timeout + 15,
+        )
+        if res.returncode == 0 and os.path.getsize(path) > 0:
+            return
+        detail = (res.stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError("curl %s: %s" % (res.returncode, detail or "пустой файл"))
+    except FileNotFoundError:
+        pass
+    req = urllib.request.Request(url, headers={"User-Agent": "ZaprosyPad"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open(path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+
+
 def fetch_latest_release():
     """Возвращает (тег, ссылка на zip) последнего релиза на GitHub."""
     url = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "ZaprosyPad",
-            "Accept": "application/vnd.github+json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    data = json.loads(http_get(url).decode("utf-8"))
     tag = data.get("tag_name") or ""
     link = None
     for asset in data.get("assets") or []:
@@ -192,10 +316,7 @@ def install_update(zip_url, bundle):
     """Качает архив релиза и подменяет .app на месте."""
     work = tempfile.mkdtemp(prefix="zaprosy-update-")
     archive = os.path.join(work, "update.zip")
-    req = urllib.request.Request(zip_url, headers={"User-Agent": "ZaprosyPad"})
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        with open(archive, "wb") as f:
-            shutil.copyfileobj(resp, f)
+    http_download(zip_url, archive)
 
     unpacked = os.path.join(work, "unpacked")
     os.makedirs(unpacked, exist_ok=True)
@@ -304,6 +425,10 @@ class App:
         self.undo_stack = []
         self.rows = []
         self.add_visible = False
+        self.search_mode = False
+        self.search_url = DEFAULT_SEARCH_URL
+        self.search_tab = 0
+        self.total = 0
         self._upd_busy = False
         self._upd_pending = None
         self._save_job = None
@@ -336,7 +461,13 @@ class App:
         self.queries = list(state.get("queries", []))
         self.cut_mode = bool(state.get("cut_mode", False))
         self.pinned = bool(state.get("pinned", True))
+        self.search_mode = bool(state.get("search_mode", False))
+        self.search_url = state.get("search_url") or DEFAULT_SEARCH_URL
+        self.total = int(state.get("total") or 0)
+        if self.total < len(self.queries):
+            self.total = len(self.queries)
         self.sw_cut.set(self.cut_mode)
+        self.update_search_look()
         self.update_pin_look()
         self.update_theme_look()
         self.render()
@@ -388,6 +519,12 @@ class App:
             fg=C["muted"], pad=(7, 4)
         )
         self.btn_theme.pack(side="right", padx=0, pady=3)
+
+        self.btn_search = IconButton(
+            bar, "⌕", self.toggle_search, font=self.f_icon,
+            fg=C["muted"], pad=(7, 4)
+        )
+        self.btn_search.pack(side="right", padx=0, pady=3)
 
         self.sep1 = tk.Frame(self.root, bg=C["border"], height=1)
         self.sep1.pack(side="top", fill="x")
@@ -468,6 +605,8 @@ class App:
         wl = max(80, event.width - 92)
         for r in self.rows:
             r["text"].configure(wraplength=wl)
+            if r.get("hint") is not None:
+                r["hint"].configure(wraplength=wl)
 
     def on_wheel(self, event):
         self.canvas.yview_scroll(int(-1 * event.delta), "units")
@@ -512,13 +651,35 @@ class App:
         )
         dele.pack(side="right", fill="y", pady=3)
 
-        lbl = tk.Label(
-            fr, text=text, bg=C["row"], fg=C["fg"], font=self.f_row, justify="left",
-            anchor="w", wraplength=wl, padx=2, pady=5
-        )
-        lbl.pack(side="left", fill="x", expand=True)
+        query, hint = split_line(text)
 
-        row = {"frame": fr, "text": lbl, "num": num, "btn": btn, "del": dele}
+        box = tk.Frame(fr, bg=C["row"])
+        box.pack(side="left", fill="x", expand=True)
+
+        hint_lbl = None
+        if hint:
+            # есть подсказка: сверху крупно по-русски, под ней сам запрос мелким
+            hint_lbl = tk.Label(
+                box, text=hint, bg=C["row"], fg=C["fg"], font=self.f_row,
+                justify="left", anchor="w", wraplength=wl, padx=2
+            )
+            hint_lbl.pack(fill="x", pady=(5, 0))
+            lbl = tk.Label(
+                box, text=query, bg=C["row"], fg=C["muted"], font=self.f_small,
+                justify="left", anchor="w", wraplength=wl, padx=2
+            )
+            lbl.pack(fill="x", pady=(1, 5))
+        else:
+            lbl = tk.Label(
+                box, text=query, bg=C["row"], fg=C["fg"], font=self.f_row,
+                justify="left", anchor="w", wraplength=wl, padx=2
+            )
+            lbl.pack(fill="x", pady=5)
+
+        row = {
+            "frame": fr, "box": box, "text": lbl, "hint": hint_lbl,
+            "num": num, "btn": btn, "del": dele,
+        }
         self.rows.append(row)
 
         def on_copy(_e=None, r=row):
@@ -527,11 +688,15 @@ class App:
         def on_delete(_e=None, r=row):
             self.delete_row(r)
 
-        parts = (fr, lbl, num, btn, dele)
+        parts = [fr, box, lbl, num, btn, dele]
+        if hint_lbl is not None:
+            parts.append(hint_lbl)
         for w in parts:
             w.bind("<MouseWheel>", self.on_wheel)
         btn.bind("<Button-1>", on_copy)
         lbl.bind("<Double-Button-1>", on_copy)
+        if hint_lbl is not None:
+            hint_lbl.bind("<Double-Button-1>", on_copy)
         dele.bind("<Button-1>", on_delete)
 
         def enter(_e=None, r=row):
@@ -553,8 +718,11 @@ class App:
         if row["frame"] in self._flash_jobs:
             return
         for k in ROW_PARTS:
+            part = row.get(k)
+            if part is None:
+                continue
             try:
-                row[k].configure(bg=color)
+                part.configure(bg=color)
             except tk.TclError:
                 pass
 
@@ -564,8 +732,11 @@ class App:
             index = self.rows.index(row)
         except ValueError:
             return
-        text = self.queries[index]
-        copy_to_clipboard(self.root, text)
+        query, _hint = split_line(self.queries[index])
+        copy_to_clipboard(self.root, query)
+
+        if self.search_mode and query:
+            self.launch_search(query)
 
         if self.cut_mode:
             self.delete_index(index)
@@ -573,6 +744,27 @@ class App:
         else:
             self.flash(row)
             self.set_hint("скопировано")
+
+    def launch_search(self, query):
+        """Открываем поиск в той же вкладке, не блокируя окно."""
+        url = self.search_url.replace("{q}", urllib.parse.quote_plus(query))
+
+        def worker():
+            tab = open_search(url, self.search_tab)
+            self.root.after(0, lambda: setattr(self, "search_tab", tab))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def toggle_search(self):
+        self.search_mode = not self.search_mode
+        self.update_search_look()
+        self.set_hint("поиск включён" if self.search_mode else "поиск выключен")
+        self.schedule_save()
+
+    def update_search_look(self):
+        self.btn_search.restyle(
+            C["bar"], C["accent"] if self.search_mode else C["muted"]
+        )
 
     def delete_row(self, row):
         try:
@@ -587,16 +779,22 @@ class App:
         if key in self._flash_jobs:
             self.root.after_cancel(self._flash_jobs[key])
         for k in ROW_PARTS:
+            part = row.get(k)
+            if part is None:
+                continue
             try:
-                row[k].configure(bg=C["flash"])
+                part.configure(bg=C["flash"])
             except tk.TclError:
                 return
 
         def restore():
             self._flash_jobs.pop(key, None)
             for k in ROW_PARTS:
+                part = row.get(k)
+                if part is None:
+                    continue
                 try:
-                    row[k].configure(bg=C["row"])
+                    part.configure(bg=C["row"])
                 except tk.TclError:
                     pass
 
@@ -664,6 +862,7 @@ class App:
             self.hide_add()
             return
         self.queries.append(text)
+        self.total += 1
         self.make_row(len(self.queries) - 1, text)
         self.update_count()
         self.schedule_save()
@@ -841,12 +1040,19 @@ class App:
         )
         self.btn_add_ok.restyle(C["accent"], "#ffffff")
         self.sw_cut.restyle()
+        self.update_search_look()
         self.update_pin_look()
         self.update_theme_look()
         self.render()
 
     def update_count(self):
-        self.lbl_count.configure(text="запросов: %d" % len(self.queries))
+        left = len(self.queries)
+        if self.total < left:
+            self.total = left
+        if self.total:
+            self.lbl_count.configure(text="%d / %d" % (self.total - left, self.total))
+        else:
+            self.lbl_count.configure(text="0 / 0")
 
     def set_hint(self, text):
         self.lbl_hint.configure(text=text)
@@ -887,7 +1093,7 @@ class App:
         self.btn_ver.configure(text="v" + APP_VERSION)
         if err is not None:
             if not silent:
-                self.set_hint("сеть недоступна")
+                self.show_message("Не удалось проверить обновления", err)
             return
         if not tag or version_tuple(tag) <= version_tuple(APP_VERSION):
             if not silent:
@@ -902,6 +1108,32 @@ class App:
         self.btn_ver.configure(text=tag + " \u2b07")
         if not silent:
             self.offer_update(tag, link)
+
+    def show_message(self, title, body):
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=C["bg"])
+        win.transient(self.root)
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        frame = tk.Frame(win, bg=C["bg"])
+        frame.pack(fill="both", expand=True, padx=18, pady=16)
+        tk.Label(
+            frame, text=title, bg=C["bg"], fg=C["fg"], font=self.f_ui, anchor="w"
+        ).pack(anchor="w")
+        txt = tk.Text(
+            frame, bg=C["field"], fg=C["muted"], font=self.f_small, wrap="word",
+            bd=0, highlightthickness=1, highlightbackground=C["border"],
+            width=54, height=6, padx=8, pady=8
+        )
+        txt.pack(fill="both", expand=True, pady=(10, 12))
+        txt.insert("1.0", body)
+        IconButton(
+            frame, "  Закрыть  ", win.destroy,
+            bg=C["row"], fg=C["fg"], font=self.f_ui, pad=(10, 6)
+        ).pack(anchor="e")
 
     def offer_update(self, tag, link):
         win = tk.Toplevel(self.root)
@@ -1010,8 +1242,10 @@ class App:
             lines = [s for s in lines if s]
             if mode == "replace":
                 self.queries = lines
+                self.total = len(lines)
             else:
                 self.queries = self.queries + lines
+                self.total += len(lines)
             self.undo_stack.clear()
             self.render()
             self.schedule_save()
@@ -1049,6 +1283,9 @@ class App:
             "cut_mode": self.cut_mode,
             "pinned": self.pinned,
             "theme": self.theme,
+            "search_mode": self.search_mode,
+            "search_url": self.search_url,
+            "total": self.total,
         }
         try:
             os.makedirs(STATE_DIR, exist_ok=True)
