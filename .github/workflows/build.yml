@@ -55,6 +55,8 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Запросы" "$PL" \
             || /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Запросы" "$PL"
           /usr/libexec/PlistBuddy -c "Set :NSHighResolutionCapable true" "$PL" || true
+          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Открывает поиск картинок в браузере" "$PL" \
+            || /usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription Открывает поиск картинок в браузере" "$PL"
           mv "$APP" "dist/Запросы.app"
           codesign --force --deep --sign - "dist/Запросы.app"
           codesign --verify --verbose "dist/Запросы.app"
