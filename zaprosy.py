@@ -36,10 +36,16 @@ STATE_DIR = os.path.join(
 )
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 
+# Сюда кладётся свежий код из релиза. Если версия в нём новее встроенной
+# в приложение — запускается он. Так обновление сводится к замене файла,
+# и пересобирать .app ради правок кода больше не нужно.
+OVERRIDE_DIR = os.path.join(STATE_DIR, "app")
+OVERRIDE_FILE = os.path.join(OVERRIDE_DIR, "zaprosy.py")
+
 DEFAULT_GEOM = "330x520+80+80"
 
 # ---------- обновления ----------
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 GITHUB_REPO = "pingujonathan7/zaprosy"
 
 # ---------- поиск картинок ----------
@@ -52,6 +58,7 @@ CHROME_SCRIPT = """
 on run argv
     set theURL to item 1 of argv
     set wantId to (item 2 of argv) as integer
+    set marker to item 3 of argv
     tell application "Google Chrome"
         set foundTab to missing value
         set foundWin to missing value
@@ -65,6 +72,18 @@ on run argv
             end repeat
             if foundTab is not missing value then exit repeat
         end repeat
+        if foundTab is missing value and marker is not "" then
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if (URL of t) contains marker then
+                        set foundTab to t
+                        set foundWin to w
+                        exit repeat
+                    end if
+                end repeat
+                if foundTab is not missing value then exit repeat
+            end repeat
+        end if
         if foundTab is missing value then
             if (count of windows) is 0 then
                 make new window
@@ -194,9 +213,15 @@ def pick_icons(root):
     Проверяем и при необходимости подставляем безопасные значки."""
     try:
         root.tk.call("string", "length", "\U0001F4CB")
-        return {"copy": "\U0001F4CB", "pin_on": "\U0001F4CC", "pin_off": "\U0001F4CD"}
+        return {
+            "copy": "\U0001F4CB", "pin_on": "\U0001F4CC",
+            "pin_off": "\U0001F4CD", "search": "\U0001F50D",
+        }
     except Exception:
-        return {"copy": "⧉", "pin_on": "▲", "pin_off": "△"}
+        return {
+            "copy": "⧉", "pin_on": "▲",
+            "pin_off": "△", "search": "⌕",
+        }
 
 
 def set_app_icon(root):
@@ -209,33 +234,35 @@ def set_app_icon(root):
         pass
 
 
-def open_search(url, tab_id):
-    """Открывает адрес в закреплённой вкладке Chrome.
+def open_search(url, tab_id, marker=""):
+    """Открывает адрес в своей вкладке Chrome.
 
-    Возвращает id вкладки, чтобы в следующий раз попасть в неё же.
-    Если Chrome недоступен — отдаём ссылку системе, она откроет
-    браузер по умолчанию новой вкладкой.
+    Вкладку ищем сначала по запомненному номеру, потом по адресу —
+    так попадаем в неё же, даже если номер сбился. Возвращаем
+    (номер вкладки, текст ошибки или None).
     """
     script = os.path.join(tempfile.gettempdir(), "zaprosy_chrome.applescript")
+    err = None
     try:
         with open(script, "w", encoding="utf-8") as f:
             f.write(CHROME_SCRIPT)
         res = subprocess.run(
-            ["/usr/bin/osascript", script, url, str(int(tab_id or 0))],
+            ["/usr/bin/osascript", script, url, str(int(tab_id or 0)), marker],
             capture_output=True, timeout=20,
         )
-        if res.returncode == 0:
-            out = res.stdout.decode("utf-8", "replace").strip()
-            if out.isdigit():
-                return int(out)
-            return tab_id
-    except Exception:
-        pass
+        out = res.stdout.decode("utf-8", "replace").strip()
+        if res.returncode == 0 and out.isdigit():
+            return int(out), None
+        err = (res.stderr or b"").decode("utf-8", "replace").strip()
+        if not err:
+            err = "Chrome вернул: %s" % (out or "пусто")
+    except Exception as exc:
+        err = str(exc)
     try:
         subprocess.Popen(["/usr/bin/open", url])
     except Exception:
         pass
-    return tab_id
+    return tab_id, err
 
 
 def version_tuple(text):
@@ -246,6 +273,47 @@ def version_tuple(text):
         else:
             break
     return tuple(parts) or (0,)
+
+
+def file_version(path):
+    """Достаём APP_VERSION из файла, не выполняя его."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for _ in range(200):
+                line = f.readline()
+                if not line:
+                    break
+                if line.startswith("APP_VERSION"):
+                    return line.split("=", 1)[1].strip().strip('"\'')
+    except Exception:
+        pass
+    return "0"
+
+
+def run_override():
+    """Если скачана версия новее встроенной — отдаём управление ей.
+
+    Возвращает True, если обновлённый код отработал. Любая поломка в нём
+    не страшна: файл отодвигается, и дальше работает встроенная версия.
+    """
+    if os.environ.get("ZAPROSY_OVERRIDE") == "1":
+        return False
+    if not os.path.exists(OVERRIDE_FILE):
+        return False
+    if version_tuple(file_version(OVERRIDE_FILE)) <= version_tuple(APP_VERSION):
+        return False
+    os.environ["ZAPROSY_OVERRIDE"] = "1"
+    try:
+        import runpy
+        runpy.run_path(OVERRIDE_FILE, run_name="__main__")
+        return True
+    except Exception:
+        try:
+            os.replace(OVERRIDE_FILE, OVERRIDE_FILE + ".broken")
+        except Exception:
+            pass
+        os.environ.pop("ZAPROSY_OVERRIDE", None)
+        return False
 
 
 def app_bundle_path():
@@ -324,15 +392,28 @@ def install_update(zip_url, bundle):
     subprocess.run(["ditto", "-x", "-k", archive, unpacked], check=True)
 
     new_app = None
-    for root_dir, dirs, _files in os.walk(unpacked):
+    new_src = None
+    for root_dir, dirs, files in os.walk(unpacked):
         for name in dirs:
             if name.endswith(".app"):
                 new_app = os.path.join(root_dir, name)
                 break
+        for name in files:
+            if name == "zaprosy.py":
+                new_src = os.path.join(root_dir, name)
         if new_app:
             break
+
+    # лёгкое обновление: в архиве только код, приложение не трогаем
+    if new_app is None and new_src is not None:
+        os.makedirs(OVERRIDE_DIR, exist_ok=True)
+        shutil.copyfile(new_src, OVERRIDE_FILE + ".new")
+        os.replace(OVERRIDE_FILE + ".new", OVERRIDE_FILE)
+        shutil.rmtree(work, ignore_errors=True)
+        return bundle
+
     if new_app is None:
-        raise RuntimeError("в архиве нет .app")
+        raise RuntimeError("в архиве нет ни .app, ни zaprosy.py")
 
     # Старую версию не удаляем сразу: её файлы ещё открыты процессом.
     # Отодвигаем рядом (тот же диск — переименование мгновенное),
@@ -428,6 +509,8 @@ class App:
         self.search_mode = False
         self.search_url = DEFAULT_SEARCH_URL
         self.search_tab = 0
+        self.current_query = ""
+        self._search_warned = False
         self.total = 0
         self._upd_busy = False
         self._upd_pending = None
@@ -453,6 +536,7 @@ class App:
         self.f_row = tkfont.Font(family="Helvetica", size=12)
         self.f_icon = tkfont.Font(family="Helvetica", size=13)
         self.f_del = tkfont.Font(family="Helvetica", size=14)
+        self.f_search = tkfont.Font(family="Helvetica", size=15)
         self.icons = pick_icons(root)
 
         self.build_toolbar()
@@ -521,13 +605,32 @@ class App:
         self.btn_theme.pack(side="right", padx=0, pady=3)
 
         self.btn_search = IconButton(
-            bar, "⌕", self.toggle_search, font=self.f_icon,
-            fg=C["muted"], pad=(7, 4)
+            bar, self.icons["search"], self.toggle_search, font=self.f_search,
+            fg=C["muted"], pad=(8, 3)
         )
         self.btn_search.pack(side="right", padx=0, pady=3)
 
         self.sep1 = tk.Frame(self.root, bg=C["border"], height=1)
         self.sep1.pack(side="top", fill="x")
+
+        # полоска: что ищем прямо сейчас и сколько строк осталось
+        self.strip = tk.Frame(self.root, bg=C["bg"])
+        self.strip.pack(side="top", fill="x")
+        self.lbl_left = tk.Label(
+            self.strip, text="", bg=C["bg"], fg=C["muted"],
+            font=self.f_small, anchor="e"
+        )
+        self.lbl_left.pack(side="right", padx=(6, 8), pady=5)
+        self.lbl_now = tk.Label(
+            self.strip, text="—", bg=C["bg"], fg=C["fg"], font=self.f_row,
+            justify="left", anchor="w", wraplength=200, cursor="pointinghand"
+        )
+        self.lbl_now.pack(side="left", fill="x", expand=True, padx=(8, 0), pady=5)
+        self.lbl_now.bind("<Button-1>", lambda e: self.repeat_copy())
+        self.strip.bind("<Configure>", self.on_strip_resize)
+
+        self.sep_strip = tk.Frame(self.root, bg=C["border"], height=1)
+        self.sep_strip.pack(side="top", fill="x")
 
         # нижняя строка состояния
         self.status = tk.Frame(self.root, bg=C["bar"])
@@ -732,8 +835,9 @@ class App:
             index = self.rows.index(row)
         except ValueError:
             return
-        query, _hint = split_line(self.queries[index])
+        query, hint = split_line(self.queries[index])
         copy_to_clipboard(self.root, query)
+        self.show_current(query, hint)
 
         if self.search_mode and query:
             self.launch_search(query)
@@ -745,15 +849,44 @@ class App:
             self.flash(row)
             self.set_hint("скопировано")
 
+    def on_strip_resize(self, event):
+        self.lbl_now.configure(wraplength=max(80, event.width - 110))
+
+    def show_current(self, query, hint):
+        """Запоминаем, что именно сейчас ищем, и держим это перед глазами."""
+        self.current_query = query
+        self.lbl_now.configure(text=hint or query or "—")
+
+    def repeat_copy(self):
+        if self.current_query:
+            copy_to_clipboard(self.root, self.current_query)
+            self.set_hint("скопировано снова")
+
     def launch_search(self, query):
         """Открываем поиск в той же вкладке, не блокируя окно."""
         url = self.search_url.replace("{q}", urllib.parse.quote_plus(query))
+        prefix = self.search_url.split("{q}")[0]
+        marker = prefix.replace("https://", "").replace("http://", "")
+        if marker.startswith("www."):
+            marker = marker[4:]
 
         def worker():
-            tab = open_search(url, self.search_tab)
-            self.root.after(0, lambda: setattr(self, "search_tab", tab))
+            tab, err = open_search(url, self.search_tab, marker)
+            self.root.after(0, lambda: self.search_done(tab, err))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def search_done(self, tab, err):
+        self.search_tab = tab
+        if err and not self._search_warned:
+            self._search_warned = True
+            self.show_message(
+                "Chrome не отвечает на команды",
+                "Ссылка открылась обычным способом, поэтому вкладки будут "
+                "копиться.\n\nПроверь: Системные настройки → Конфиденциальность "
+                "и безопасность → Автоматизация → Запросы → Google Chrome.\n\n"
+                "Ответ системы:\n" + err
+            )
 
     def toggle_search(self):
         self.search_mode = not self.search_mode
@@ -762,9 +895,10 @@ class App:
         self.schedule_save()
 
     def update_search_look(self):
-        self.btn_search.restyle(
-            C["bar"], C["accent"] if self.search_mode else C["muted"]
-        )
+        if self.search_mode:
+            self.btn_search.restyle(C["accent"], "#ffffff")
+        else:
+            self.btn_search.restyle(C["bar"], C["muted"])
 
     def delete_row(self, row):
         try:
@@ -1039,6 +1173,10 @@ class App:
             C["bar"], C["accent"] if self._upd_pending else C["muted"]
         )
         self.btn_add_ok.restyle(C["accent"], "#ffffff")
+        self.strip.configure(bg=C["bg"])
+        self.lbl_now.configure(bg=C["bg"], fg=C["fg"])
+        self.lbl_left.configure(bg=C["bg"], fg=C["muted"])
+        self.sep_strip.configure(bg=C["border"])
         self.sw_cut.restyle()
         self.update_search_look()
         self.update_pin_look()
@@ -1047,12 +1185,8 @@ class App:
 
     def update_count(self):
         left = len(self.queries)
-        if self.total < left:
-            self.total = left
-        if self.total:
-            self.lbl_count.configure(text="%d / %d" % (self.total - left, self.total))
-        else:
-            self.lbl_count.configure(text="0 / 0")
+        self.lbl_left.configure(text="осталось: %d" % left)
+        self.lbl_count.configure(text="запросов: %d" % left)
 
     def set_hint(self, text):
         self.lbl_hint.configure(text=text)
@@ -1313,6 +1447,8 @@ class App:
 
 
 def main():
+    if run_override():
+        return
     root = tk.Tk()
     App(root)
     root.mainloop()
